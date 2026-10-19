@@ -1,3 +1,4 @@
+# fork 维护备注：本文件与上游 dipa-studio/ios-sweet 保持一致，仅用于在本 fork 中注册 xnu workflow。
 name: xnu
 
 on:
