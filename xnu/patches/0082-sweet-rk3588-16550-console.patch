@@ -297,3 +297,85 @@
  	// Return to arm_init()
  	ret
  
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -13,6 +13,42 @@
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
++
++/*
++ * RK3588 has no framebuffer handed over by its bootloader, and 0x9c000000 is
++ * ordinary DRAM there -- every sweet_early_mark() would be invisible. The
++ * board's only output path is the DesignWare 16550 at 0xfeb50000, which the
++ * shim leaves running at 1500000 8N1.
++ *
++ * Decided once, from MIDR_EL1 implementer: ARM Ltd is 0x41, Qualcomm's Kryo is
++ * 0x51. That keeps the same kernel binary harmless on the Redmi Note 10 Pro,
++ * where 0xfeb50000 is not a UART.
++ */
++static volatile uint32_t *early_uart;
++static int early_mode_done;
++
++static void
++sweet_early_mode(void)
++{
++	uint64_t midr;
++
++	if (early_mode_done) {
++		return;
++	}
++	early_mode_done = 1;
++	__asm__ volatile("mrs %0, MIDR_EL1" : "=r"(midr));
++	if ((uint32_t)(midr >> 24) == 0x41u) {
++		early_uart = (volatile uint32_t *)(uintptr_t)0xfeb50000;
++	}
++}
++
++/* True when this platform writes to the UART instead of the splash buffer. */
++static int
++sweet_early_uart_only(void)
++{
++	sweet_early_mode();
++	return early_uart != NULL;
++}
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+ #define EARLY_STRIDE (4320u / 4)
+@@ -45,6 +81,19 @@
+ 	if (early_disabled) {
+ 		return;
+ 	}
++	if (sweet_early_uart_only()) {
++		/* 16550: poll THR-empty, bounded so a wedged block cannot hang. */
++		if (c == '\n') {
++			sweet_early_putc('\r');
++		}
++		for (unsigned int i = 0; i < 100000; i++) {
++			if (early_uart[5] & 0x20u) {   /* LSR bit 5 = THR empty */
++				break;
++			}
++		}
++		early_uart[0] = (uint32_t)(unsigned char)c;
++		return;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -92,10 +141,12 @@
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++	if (!sweet_early_uart_only()) {
++		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
++		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++				EARLY_FB[y * EARLY_STRIDE + x] = color;
++			}
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
