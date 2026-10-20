@@ -1,0 +1,218 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ecf62bb..8629db0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_emmc.c			standard
++bsd/dev/sweet_wdt.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index f0124d8..437891f 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -57,6 +57,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_wdt_start(void);
+ 
+ /* ---------------------------------------------------------------- SDHCI -- */
+ 
+@@ -603,6 +604,45 @@ se_find_partition(const char *want)
+ 		se.nblocks = last - first + 1;
+ 		return 0;
+ 	}
++	/*
++	 * Nothing matched. The board's Android layout uses Rockchip's own names,
++	 * so the default "userdata" may not exist; exposing the largest
++	 * partition still gives the boot path a block device to inspect, and the
++	 * GPT dump above says what the real names are.
++	 */
++	{
++		uint64_t best_first = 0, best_last = 0;
++		char best_name[37] = "";
++
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = b + i * esz;
++			uint64_t first, last;
++			unsigned c;
++
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			if (last <= first || last - first + 1 <= best_last - best_first + 1) {
++				continue;
++			}
++			best_first = first;
++			best_last = last;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				best_name[c] = (char)ch;
++			}
++			best_name[c] = 0;
++		}
++		if (best_last > best_first) {
++			printf("SWEET EMMC: no \"%s\", using the largest partition \"%s\"\n",
++			    want, best_name);
++			se.first_block = best_first;
++			se.nblocks = best_last - best_first + 1;
++			return 0;
++		}
++	}
+ 	printf("SWEET EMMC: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+@@ -908,6 +948,11 @@ sweet_emmc_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	/*
++	 * The SoC watchdog cannot be turned off from the CPU (pitfalls.md 91), so
++	 * something has to keep kicking it for as long as the kernel runs.
++	 */
++	sweet_wdt_start();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_wdt.c b/bsd/dev/sweet_wdt.c
+new file mode 100644
+index 0000000..8661d33
+--- /dev/null
++++ b/bsd/dev/sweet_wdt.c
+@@ -0,0 +1,130 @@
++/*
++ * SWEET RK3588 watchdog keeper.
++ *
++ * The RK3588 has a DesignWare watchdog at 0xfeaf0000 whose counter runs from
++ * 2^(16+TORR) pclk cycles. Measured on this board (toolchain/wdt-ccvr.py,
++ * pitfalls.md 91):
++ *
++ *   pclk = 24 MHz, TORR = 0xf -> 2^31 / 24 MHz = 89.5 s to reset
++ *
++ * and, more importantly, it cannot be turned off from the CPU: writing
++ * CR = 0 does not stop the counter, only CRR = 0x76 restarts it. Verified by
++ * reading CCVR before and after the write -- it keeps decreasing. Whatever
++ * arms it (the bootloader, or the PMU) leaves it armed, so the kernel has to
++ * keep kicking it or the board resets 89 s into a perfectly healthy boot.
++ *
++ * So this driver does the only thing that works: a kernel thread writes CRR
++ * every 5 s. It is deliberately dumb -- no IOKit service, no user client --
++ * because IOWatchdog (iokit/Kernel/arm/SweetWatchdog.cpp) is the *userspace*
++ * contract with watchdogd, not a hardware driver.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++#define SWEET_WDT_PA      0xfeaf0000UL
++#define SWEET_WDT_CR      0x00
++#define SWEET_WDT_TORR    0x04
++#define SWEET_WDT_CRR     0x0c
++#define SWEET_WDT_CRR_RESTART 0x76
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer (same as
++ * sweet_emmc.c and sweet_keys.c). */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static volatile uint32_t *wdt_regs;
++static uint64_t wdt_period_ms = 5000;
++static lck_grp_t *wdt_grp;
++static lck_mtx_t *wdt_lock;
++static void *wdt_chan;
++
++static inline uint32_t
++wdt_rd(unsigned off)
++{
++	return wdt_regs[off / 4];
++}
++
++static inline void
++wdt_wr(unsigned off, uint32_t v)
++{
++	wdt_regs[off / 4] = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++wdt_sleep(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline((uint32_t)wdt_period_ms, NSEC_PER_MSEC, &deadline);
++	lck_mtx_lock(wdt_lock);
++	(void)assert_wait_deadline(wdt_chan, THREAD_UNINT, deadline);
++	lck_mtx_unlock(wdt_lock);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++wdt_thread(void *arg, wait_result_t result)
++{
++	uint32_t kicks = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		wdt_wr(SWEET_WDT_CRR, SWEET_WDT_CRR_RESTART);
++		if ((++kicks % 60u) == 0) {
++			/* Every 5 minutes: prove it is still alive and show the counter. */
++			printf("SWEET WDT: kicked %u times, ccvr=%#x cr=%#x\n",
++			    kicks, wdt_rd(0x08), wdt_rd(SWEET_WDT_CR));
++		}
++		wdt_sleep();
++	}
++}
++
++void
++sweet_wdt_start(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (wdt_regs != NULL) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetwdt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET WDT: keeper disabled (sweetwdt=0)\n");
++		return;
++	}
++	wdt_regs = (volatile uint32_t *)ml_io_map(SWEET_WDT_PA, 0x100);
++	if (wdt_regs == NULL) {
++		printf("SWEET WDT: cannot map %#lx\n", (unsigned long)SWEET_WDT_PA);
++		return;
++	}
++	/*
++	 * Longest timeout the block offers, so a busy system still has plenty of
++	 * margin between kicks. TORR is only honoured on the CRR reload, which is
++	 * the first thing the thread does.
++	 */
++	wdt_wr(SWEET_WDT_TORR, 0x0f);
++	wdt_wr(SWEET_WDT_CRR, SWEET_WDT_CRR_RESTART);
++	printf("SWEET WDT: keeper on %#lx, cr=%#x torr=%#x ccvr=%#x (pclk 24 MHz, ~%u s)\n",
++	    (unsigned long)SWEET_WDT_PA, wdt_rd(SWEET_WDT_CR), wdt_rd(SWEET_WDT_TORR),
++	    wdt_rd(0x08), (unsigned)((1ULL << (16 + 15)) / 24000000ULL));
++
++	wdt_grp = lck_grp_alloc_init("sweet-wdt", LCK_GRP_ATTR_NULL);
++	wdt_lock = lck_mtx_alloc_init(wdt_grp, LCK_ATTR_NULL);
++	wdt_chan = (void *)&wdt_regs;
++	if (kernel_thread_start(wdt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET WDT: kernel_thread_start failed\n");
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
