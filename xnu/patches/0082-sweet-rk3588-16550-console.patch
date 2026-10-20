@@ -139,14 +139,35 @@
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -923,6 +1055,7 @@
- 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+@@ -914,14 +1046,25 @@
+ 		return 1;
+ 	}
  
- 	fbcon_probe();
++	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
++
++	/*
++	 * Nodes whose "reg" is an absolute physical address do not need SOC_BASE,
++	 * so the 16550 probe has to run before the gate below. That gate is
++	 * `soc_base == 0 -> no serial`, and on RK3588 arm-io's "ranges" start at 0
++	 * (SOC_BASE is 0), so a probe placed after it would never run -- leaving
++	 * the board with no console at all, because the same U-Boot hands over no
++	 * framebuffer either.
++	 */
 +	uart16550_probe();
++
+ 	soc_base = pe_arm_get_soc_base_phys();
+ 
+ 	if (soc_base == 0) {
+-		return 0;
++		/* Absolute-address consoles above are all this platform has. */
++		return gPESF != NULL;
+ 	}
+ 
+-	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+-
+ 	fbcon_probe();
  
  #ifdef PI3_UART
- 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
 --- a/pexpert/pexpert/arm/protos.h
 +++ b/pexpert/pexpert/arm/protos.h
 @@ -51,7 +51,8 @@
