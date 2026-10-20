@@ -180,3 +180,33 @@
  } serial_device_t;
  
  kern_return_t serial_irq_enable(serial_device_t device);
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -514,6 +514,27 @@
+ 	mov		x21, #0
+ 
+ #if defined(SWEET)
++	/*
++	 * RK3588 stage 0: one character on the 16550 debug UART.
++	 *
++	 * The band below writes to the Redmi Note 10 Pro's splash framebuffer at
++	 * 0x9c000000, which on an RK3588 is ordinary DRAM: harmless but silent.
++	 * Without this marker a boot that dies anywhere before serial_init() is
++	 * indistinguishable from one that never entered the kernel at all.
++	 *
++	 * MMU and caches are off and no stack exists, so this is a bare polled
++	 * store to the physical UART. 0xfeb50000 is RK3588's debug UART; the shim
++	 * has already programmed it for 1500000 8N1, so only THR is written.
++	 */
++	MOV64	x0, 0xfeb50000
++	mov	w1, #'K'
++	str	w1, [x0]
++	mov	w1, #'\r'
++	str	w1, [x0]
++	mov	w1, #'\n'
++	str	w1, [x0]
++	dsb		sy
++
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ 	mov		w1, #-1
