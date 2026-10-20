@@ -1,3 +1,275 @@
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,10 +1843,27 @@
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	/*
++	 * sweet_early_relocate() points the console at this VA next. Which
++	 * physical 32MB block it aliases depends on the console backend chosen
++	 * from MIDR_EL1 (see osfmk/arm64/sweet_early.c):
++	 *   Qualcomm -> 0x9c000000, the splash framebuffer, Normal non-cacheable
++	 *   ARM Ltd  -> 0xfe000000, the RK3588 peripheral window, Device so that
++	 *               a polled UART write cannot be reordered past the THRE
++	 *               read. Without this the early console dies the moment
++	 *               bootstrap TTBR0 goes away, which is where the RK3588 boot
++	 *               was stopping.
++	 */
++	if (sweet_early_uses_uart()) {
++		*slot = 0xfe000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	} else {
++		*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -212,6 +212,44 @@
+ 	.text
+ 
+ 
++#if defined(SWEET)
++/*
++ * RK3588 bring-up markers.
++ *
++ * The board hands over no framebuffer, so sweet_early_mark() (which paints the
++ * Redmi Note 10 Pro's splash buffer at 0x9c000000) is invisible here -- that
++ * address is plain DRAM on RK3588. A polled write to the debug UART works at
++ * every point in this file, with the MMU on or off, because 0xfeb50000 is
++ * mapped identity (bootstrap tables) and the shim has already programmed it
++ * for 1500000 8N1.
++ *
++ * Format: one character per marker, so the position in the boot sequence is
++ * readable straight off the serial line.
++ */
++.macro SWEET_UART_MARK ch
++	/*
++	 * Runtime gate on the CPU implementer: ARM Ltd reports 0x41, Qualcomm's
++	 * custom Kryo cores report 0x51. The same SWEET kernel binary boots both
++	 * the Redmi Note 10 Pro and this board, and 0xfeb50000 is not a UART on
++	 * SM7150 -- writing there could disturb an unrelated block on the one
++	 * working installation. Checking MIDR_EL1 costs a few cycles and makes
++	 * the marker a no-op on the phone.
++	 */
++	mrs		x13, MIDR_EL1
++	lsr		x13, x13, #24
++	cmp		x13, #0x41
++	b.ne	9997f
++	MOV64	x13, 0xfeb50000
++	mov	w14, #\ch
++	str		w14, [x13]
++	dsb		sy
++9997:
++.endmacro
++#else
++.macro SWEET_UART_MARK ch
++.endmacro
++#endif
++
+ /*
+  * __start trampoline is located at a position relative to LowResetVectorBase
+  * so that iBoot can compute the reset vector position to set IORVBAR using
+@@ -514,6 +552,20 @@
+ 	mov		x21, #0
+ 
+ #if defined(SWEET)
++	/*
++	 * RK3588 stage 0: one character on the 16550 debug UART.
++	 *
++	 * The band below writes to the Redmi Note 10 Pro's splash framebuffer at
++	 * 0x9c000000, which on an RK3588 is ordinary DRAM: harmless but silent.
++	 * Without this marker a boot that dies anywhere before serial_init() is
++	 * indistinguishable from one that never entered the kernel at all.
++	 *
++	 * MMU and caches are off and no stack exists, so this is a bare polled
++	 * store to the physical UART. 0xfeb50000 is RK3588's debug UART; the shim
++	 * has already programmed it for 1500000 8N1, so only THR is written.
++	 */
++	SWEET_UART_MARK 'K'
++
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ 	mov		w1, #-1
+@@ -693,8 +745,30 @@
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++
++	/*
++	 * RK3588 debug UART: map 0xfe000000..0xffffffff as Device, in the same
++	 * V=P L2 table and with the same V=P identity, so pe_kprintf and the
++	 * early markers can reach it once the MMU is on. Without this the only
++	 * console the board has is unreachable for all of arm_init(), which is
++	 * exactly the window where a bring-up failure is currently silent.
++	 *
++	 * One 32MB L2 block covers 0xfe000000..0xffffffff exactly, which holds
++	 * the UART, the GIC and the CRU. Device-nGnRnE (attrindx 0). This is the
++	 * same L2 table the V=P RAM mapping lives in (L1 index 0 for the whole
++	 * 64GB), so no extra table is needed.
++	 */
++	MOV64	x10, 0xfe000000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
++	SWEET_UART_MARK 'T'
++
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
+@@ -837,6 +911,8 @@
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	SWEET_UART_MARK 'M'
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
+@@ -899,6 +975,8 @@
+ 	mov	lr, x21
+ #endif
+ 
++	SWEET_UART_MARK 'C'
++
+ 	// Return to arm_init()
+ 	ret
+ 
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -13,6 +13,42 @@
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+ #define EARLY_FB early_fb
++
++/*
++ * RK3588 has no framebuffer handed over by its bootloader, and 0x9c000000 is
++ * ordinary DRAM there -- every sweet_early_mark() would be invisible. The
++ * board's only output path is the DesignWare 16550 at 0xfeb50000, which the
++ * shim leaves running at 1500000 8N1.
++ *
++ * Decided once, from MIDR_EL1 implementer: ARM Ltd is 0x41, Qualcomm's Kryo is
++ * 0x51. That keeps the same kernel binary harmless on the Redmi Note 10 Pro,
++ * where 0xfeb50000 is not a UART.
++ */
++static volatile uint32_t *early_uart;
++static int early_mode_done;
++
++static void
++sweet_early_mode(void)
++{
++	uint64_t midr;
++
++	if (early_mode_done) {
++		return;
++	}
++	early_mode_done = 1;
++	__asm__ volatile("mrs %0, MIDR_EL1" : "=r"(midr));
++	if ((uint32_t)(midr >> 24) == 0x41u) {
++		early_uart = (volatile uint32_t *)(uintptr_t)0xfeb50000;
++	}
++}
++
++/* True when this platform writes to the UART instead of the splash buffer. */
++int
++sweet_early_uses_uart(void)
++{
++	sweet_early_mode();
++	return early_uart != NULL;
++}
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+ #define EARLY_STRIDE (4320u / 4)
+@@ -45,6 +81,19 @@
+ 	if (early_disabled) {
+ 		return;
+ 	}
++	if (sweet_early_uses_uart()) {
++		/* 16550: poll THR-empty, bounded so a wedged block cannot hang. */
++		if (c == '\n') {
++			sweet_early_putc('\r');
++		}
++		for (unsigned int i = 0; i < 100000; i++) {
++			if (early_uart[5] & 0x20u) {   /* LSR bit 5 = THR empty */
++				break;
++			}
++		}
++		early_uart[0] = (uint32_t)(unsigned char)c;
++		return;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -92,10 +141,12 @@
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++	if (!sweet_early_uses_uart()) {
++		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
++		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++				EARLY_FB[y * EARLY_STRIDE + x] = color;
++			}
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -129,9 +180,18 @@
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	if (sweet_early_uses_uart()) {
++		/*
++		 * The kernel VA alias of the 32MB peripheral block (mapped by
++		 * arm_vm_init before TTBR0 is dropped). Bootstrap TTBR0 is about
++		 * to go away, so every later marker has to use this VA.
++		 */
++		early_uart = (volatile uint32_t *)(uintptr_t)(base + 0x0b50000);
++	} else {
++		early_fb = (volatile uint32_t *)(uintptr_t)base;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_mark(9, "kernel framebuffer VA live");
++	sweet_early_mark(9, "early console VA live");
+ }
+ 
+ void
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -11,6 +11,7 @@
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
++int sweet_early_uses_uart(void);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -18,6 +19,7 @@
+ 	(void)stage;
+ 	(void)label;
+ }
++static inline int sweet_early_uses_uart(void) { return 0; }
+ static inline void sweet_early_disable(void) {}
+ #endif
+ 
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
 @@ -842,6 +842,138 @@
@@ -180,202 +452,3 @@
  } serial_device_t;
  
  kern_return_t serial_irq_enable(serial_device_t device);
---- a/osfmk/arm64/start.s
-+++ b/osfmk/arm64/start.s
-@@ -212,6 +212,44 @@
- 	.text
- 
- 
-+#if defined(SWEET)
-+/*
-+ * RK3588 bring-up markers.
-+ *
-+ * The board hands over no framebuffer, so sweet_early_mark() (which paints the
-+ * Redmi Note 10 Pro's splash buffer at 0x9c000000) is invisible here -- that
-+ * address is plain DRAM on RK3588. A polled write to the debug UART works at
-+ * every point in this file, with the MMU on or off, because 0xfeb50000 is
-+ * mapped identity (bootstrap tables) and the shim has already programmed it
-+ * for 1500000 8N1.
-+ *
-+ * Format: one character per marker, so the position in the boot sequence is
-+ * readable straight off the serial line.
-+ */
-+.macro SWEET_UART_MARK ch
-+	/*
-+	 * Runtime gate on the CPU implementer: ARM Ltd reports 0x41, Qualcomm's
-+	 * custom Kryo cores report 0x51. The same SWEET kernel binary boots both
-+	 * the Redmi Note 10 Pro and this board, and 0xfeb50000 is not a UART on
-+	 * SM7150 -- writing there could disturb an unrelated block on the one
-+	 * working installation. Checking MIDR_EL1 costs a few cycles and makes
-+	 * the marker a no-op on the phone.
-+	 */
-+	mrs		x13, MIDR_EL1
-+	lsr		x13, x13, #24
-+	cmp		x13, #0x41
-+	b.ne	9997f
-+	MOV64	x13, 0xfeb50000
-+	mov	w14, #\ch
-+	str		w14, [x13]
-+	dsb		sy
-+9997:
-+.endmacro
-+#else
-+.macro SWEET_UART_MARK ch
-+.endmacro
-+#endif
-+
- /*
-  * __start trampoline is located at a position relative to LowResetVectorBase
-  * so that iBoot can compute the reset vector position to set IORVBAR using
-@@ -514,6 +552,20 @@
- 	mov		x21, #0
- 
- #if defined(SWEET)
-+	/*
-+	 * RK3588 stage 0: one character on the 16550 debug UART.
-+	 *
-+	 * The band below writes to the Redmi Note 10 Pro's splash framebuffer at
-+	 * 0x9c000000, which on an RK3588 is ordinary DRAM: harmless but silent.
-+	 * Without this marker a boot that dies anywhere before serial_init() is
-+	 * indistinguishable from one that never entered the kernel at all.
-+	 *
-+	 * MMU and caches are off and no stack exists, so this is a bare polled
-+	 * store to the physical UART. 0xfeb50000 is RK3588's debug UART; the shim
-+	 * has already programmed it for 1500000 8N1, so only THR is written.
-+	 */
-+	SWEET_UART_MARK 'K'
-+
- 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
- 	MOV64	x0, (0x9c000000 + 2368 * 4320)
- 	mov		w1, #-1
-@@ -693,8 +745,30 @@
- 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
- 	add		x13, x25, #(2 * PGBYTES)
- 	str		x11, [x13, x12, lsl #TTE_SHIFT]
-+
-+	/*
-+	 * RK3588 debug UART: map 0xfe000000..0xffffffff as Device, in the same
-+	 * V=P L2 table and with the same V=P identity, so pe_kprintf and the
-+	 * early markers can reach it once the MMU is on. Without this the only
-+	 * console the board has is unreachable for all of arm_init(), which is
-+	 * exactly the window where a bring-up failure is currently silent.
-+	 *
-+	 * One 32MB L2 block covers 0xfe000000..0xffffffff exactly, which holds
-+	 * the UART, the GIC and the CRU. Device-nGnRnE (attrindx 0). This is the
-+	 * same L2 table the V=P RAM mapping lives in (L1 index 0 for the whole
-+	 * 64GB), so no extra table is needed.
-+	 */
-+	MOV64	x10, 0xfe000000
-+	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
-+	orr		x11, x11, x10
-+	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
-+	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
-+	add		x13, x25, #(2 * PGBYTES)
-+	str		x11, [x13, x12, lsl #TTE_SHIFT]
- #endif
- 
-+	SWEET_UART_MARK 'T'
-+
- 	/* Ensure TTEs are visible */
- 	dsb		ish
- 
-@@ -837,6 +911,8 @@
- 	MSR_SCTLR_EL1_X0
- 	isb		sy
- 
-+	SWEET_UART_MARK 'M'
-+
- #if !VMAPPLE && !defined(SWEET)
- 	MOV64   x1, SCTLR_EL1_DEFAULT
- 	cmp		x0, x1
-@@ -899,6 +975,8 @@
- 	mov	lr, x21
- #endif
- 
-+	SWEET_UART_MARK 'C'
-+
- 	// Return to arm_init()
- 	ret
- 
---- a/osfmk/arm64/sweet_early.c
-+++ b/osfmk/arm64/sweet_early.c
-@@ -13,6 +13,42 @@
- 
- static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
- #define EARLY_FB early_fb
-+
-+/*
-+ * RK3588 has no framebuffer handed over by its bootloader, and 0x9c000000 is
-+ * ordinary DRAM there -- every sweet_early_mark() would be invisible. The
-+ * board's only output path is the DesignWare 16550 at 0xfeb50000, which the
-+ * shim leaves running at 1500000 8N1.
-+ *
-+ * Decided once, from MIDR_EL1 implementer: ARM Ltd is 0x41, Qualcomm's Kryo is
-+ * 0x51. That keeps the same kernel binary harmless on the Redmi Note 10 Pro,
-+ * where 0xfeb50000 is not a UART.
-+ */
-+static volatile uint32_t *early_uart;
-+static int early_mode_done;
-+
-+static void
-+sweet_early_mode(void)
-+{
-+	uint64_t midr;
-+
-+	if (early_mode_done) {
-+		return;
-+	}
-+	early_mode_done = 1;
-+	__asm__ volatile("mrs %0, MIDR_EL1" : "=r"(midr));
-+	if ((uint32_t)(midr >> 24) == 0x41u) {
-+		early_uart = (volatile uint32_t *)(uintptr_t)0xfeb50000;
-+	}
-+}
-+
-+/* True when this platform writes to the UART instead of the splash buffer. */
-+static int
-+sweet_early_uart_only(void)
-+{
-+	sweet_early_mode();
-+	return early_uart != NULL;
-+}
- #define EARLY_WIDTH 1080u
- #define EARLY_HEIGHT 2400u
- #define EARLY_STRIDE (4320u / 4)
-@@ -45,6 +81,19 @@
- 	if (early_disabled) {
- 		return;
- 	}
-+	if (sweet_early_uart_only()) {
-+		/* 16550: poll THR-empty, bounded so a wedged block cannot hang. */
-+		if (c == '\n') {
-+			sweet_early_putc('\r');
-+		}
-+		for (unsigned int i = 0; i < 100000; i++) {
-+			if (early_uart[5] & 0x20u) {   /* LSR bit 5 = THR empty */
-+				break;
-+			}
-+		}
-+		early_uart[0] = (uint32_t)(unsigned char)c;
-+		return;
-+	}
- 	if (!early_started) {
- 		early_started = 1;
- 		sweet_early_clear_row();
-@@ -92,10 +141,12 @@
- 	if (early_disabled || stage > 20) {
- 		return;
- 	}
--	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
--	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
--		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
--			EARLY_FB[y * EARLY_STRIDE + x] = color;
-+	if (!sweet_early_uart_only()) {
-+		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
-+		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
-+			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
-+				EARLY_FB[y * EARLY_STRIDE + x] = color;
-+			}
- 		}
- 	}
- 	__asm__ volatile("dsb sy" ::: "memory");
