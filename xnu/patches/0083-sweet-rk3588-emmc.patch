@@ -1,0 +1,1031 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..ecf62bb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+index 0000000..f0124d8
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,929 @@
++/*
++ * SWEET eMMC root device (Rockchip RK3588).
++ *
++ * RK3588 has no UFS. Its internal storage is an eMMC behind a Synopsys
++ * DesignWare Cores Mobile Storage Host Controller ("dwcmshc") at 0xfe2e0000
++ * that speaks the standard SDHCI register set. The bootloader has just read
++ * our boot image off it, so the controller, the card clock, the bus width and
++ * the card itself are in a known-good working state; this driver deliberately
++ * keeps all of it and only moves data.
++ *
++ * Two measured facts shape the whole file (pitfalls.md 78 has the bisect):
++ *
++ *   - Command completion is reported through SDHCI_INT_ENABLE, not
++ *     SIGNAL_ENABLE. Clearing INT_ENABLE does not "turn off interrupts", it
++ *     turns off the status bits, and every command then times out with a
++ *     status word of zero. So INT_ENABLE stays fully open and only
++ *     SIGNAL_ENABLE is cleared, which is what keeps this driver polled.
++ *   - The data path only completes in the bus configuration the bootloader
++ *     left, and its PIO limit there is four blocks per command -- the same
++ *     limit U-Boot itself applies in HS200/HS400.
++ *
++ * Data therefore moves through the SDHCI buffer port one word at a time:
++ * no DMA memory, no cache maintenance at all, which matters on a machine
++ * whose caches are not coherent with the storage host (this kernel has
++ * __ARM_COHERENT_CACHE__, so no driver here does manual cache work).
++ *
++ * It finds one GPT partition by name (boot-arg emmcroot=, default
++ * "userdata"), prints the whole GPT to the console, and exposes the partition
++ * as the BSD disk emmcroot0 (remmcroot0) with 512-byte logical sectors. Root
++ * on it with rd=emmcroot0.
++ *
++ * Writes are refused unless boot-arg emmcrw=1 is set, and every write is
++ * bounds-checked against the partition right before it is issued.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void sweet_sample_start(void);
++extern void sweet_keys_init(void);
++extern void sweet_touch_init(void);
++extern void sweet_usb_probe(void);
++
++/* ---------------------------------------------------------------- SDHCI -- */
++
++#define REG_DMA_ADDR            0x00
++#define REG_BLOCK_SIZE          0x04
++#define REG_BLOCK_COUNT         0x06
++#define REG_ARGUMENT            0x08
++#define REG_TRANSFER_MODE       0x0c
++#define REG_COMMAND             0x0e
++#define REG_RESPONSE            0x10
++#define REG_BUFFER              0x20
++#define REG_PRESENT_STATE       0x24
++#define REG_HOST_CONTROL        0x28
++#define REG_POWER_CONTROL       0x29
++#define REG_CLOCK_CONTROL       0x2c
++#define REG_TIMEOUT_CONTROL     0x2e
++#define REG_SOFTWARE_RESET      0x2f
++#define REG_INT_STATUS          0x30
++#define REG_INT_ENABLE          0x34
++#define REG_SIGNAL_ENABLE       0x38
++#define REG_HOST_CONTROL2       0x3e
++#define REG_CAPABILITIES        0x40
++#define REG_HOST_VERSION        0xfe
++
++#define PS_CMD_INHIBIT          (1u << 0)
++#define PS_DATA_INHIBIT         (1u << 1)
++#define PS_DOING_WRITE          (1u << 8)
++#define PS_DOING_READ           (1u << 9)
++#define PS_SPACE_AVAILABLE      (1u << 10)
++#define PS_DATA_AVAILABLE       (1u << 11)
++#define PS_CARD_INSERTED        (1u << 16)
++
++#define TM_DMA                  (1u << 0)
++#define TM_BLOCK_COUNT_EN       (1u << 1)
++#define TM_READ                 (1u << 4)
++#define TM_MULTI                (1u << 5)
++
++#define CMD_RESP_NONE           0x00
++#define CMD_RESP_LONG           0x01
++#define CMD_RESP_SHORT          0x02
++#define CMD_RESP_SHORT_BUSY     0x03
++#define CMD_CRC                 (1u << 3)
++#define CMD_INDEX               (1u << 4)
++#define CMD_DATA                (1u << 5)
++
++#define INT_RESPONSE            (1u << 0)
++#define INT_DATA_END            (1u << 1)
++#define INT_DATA_AVAILABLE      (1u << 5)
++#define INT_SPACE_AVAILABLE     (1u << 4)
++#define INT_ERROR               (1u << 15)
++#define INT_ERROR_MASK          0xffff8000u
++
++#define CLOCK_INT_EN            (1u << 0)
++#define CLOCK_INT_STABLE        (1u << 1)
++#define CLOCK_CARD_EN           (1u << 2)
++
++#define RESET_ALL               (1u << 0)
++#define RESET_CMD               (1u << 1)
++#define RESET_DATA              (1u << 2)
++
++#define CAP_CLOCK_BASE_MASK     0xff00u
++#define CAP_CLOCK_BASE_SHIFT    8
++#define CAP_64BIT_V4            (1u << 28)
++/* assigned-clock-rates for mmc@fe2e0000 in the RK3588 EVB10 device tree. */
++#define BASE_CLOCK_HZ           200000000u
++
++/* dwcmshc vendor registers behind the DesignWare vendor area. */
++#define DWCMSHC_P_VENDOR_AREA2  0xea
++#define DWCMSHC_P_VENDOR_AREA1  0xe8
++#define DWCMSHC_AREA1_MASK      0xfffu
++#define DWCMSHC_EMMC_DLL_CTRL   0x800
++#define DWCMSHC_EMMC_DLL_RXCLK  0x804
++#define DWCMSHC_EMMC_DLL_TXCLK  0x808
++#define DWCMSHC_EMMC_DLL_STRBIN 0x80c
++#define DWCMSHC_EMMC_MISC_CON   0x81c
++/* inside vendor area 1: bit 0 = CARD_IS_EMMC (enables Data Strobe for HS400),
++ * bit 8 = ENHANCED_STROBE. U-Boot sets both; at legacy speed neither applies. */
++#define DWCMSHC_EMMC_CONTROL    0x2c
++#define EMMC_CTRL_CARD_IS_EMMC  (1u << 0)
++#define EMMC_CTRL_ENHANCED_STROBE (1u << 8)
++#define DLL_CMDOUT              0x810
++#define DLL_BYPASS              (1u << 24)
++#define DLL_START               (1u << 0)
++#define DLL_DLYENA              (1u << 27)
++#define DLL_RXCLK_ORI_GATE      (1u << 31)
++#define STRBIN_DELAY_NUM_SEL    (1u << 26)
++#define STRBIN_DELAY_NUM_DEFAULT 0x16
++
++#define EMMC_BLOCK              512u
++/*
++ * One block per command. Multi-block PIO is where U-Boot's own driver limits
++ * itself to four blocks in these speed modes, and single-block CMD17/CMD24 is
++ * the variant that was verified on this board from the shim. Reading a whole
++ * partition this way is slow, but the boot path only reads the GPT.
++ */
++/*
++ * The bounce buffer has to hold the whole GPT entry array in one go (128
++ * entries x 128 bytes = 16 KiB, i.e. 32 blocks). One command still moves one
++ * block; this only sizes the staging area.
++ */
++#define BOUNCE_BLOCKS           32u
++#define BOUNCE_SIZE             (BOUNCE_BLOCKS * EMMC_BLOCK)
++#define CMD_TIMEOUT_MS          1000u
++#define DATA_TIMEOUT_MS         5000u
++/*
++ * Legacy (default) speed. The card is put back through GO_IDLE_STATE, which
++ * also drops it out of whatever HS200/HS400 timing U-Boot left it in; the
++ * host side then bypasses the dwcmshc DLL, so both ends are in plain
++ * single-data-rate legacy mode and no tuning is involved. The port is slow
++ * (word-at-a-time PIO) but it is the configuration with the fewest unknowns.
++ * boot-arg emmchz= overrides it.
++ */
++#define CLOCK_DEFAULT_KHZ       25000u
++#define CLOCK_LEGACY_MAX_KHZ    26000u
++
++static struct {
++	vm_offset_t regs;
++	uint32_t    area1;              /* vendor area 1 offset (dwcmshc) */
++	uint32_t    base_hz;            /* host base clock from CAPABILITIES */
++	uint32_t    rca;
++	uint32_t    hz;                 /* clock we asked for */
++	uint64_t    first_block, nblocks;   /* partition, in 512-byte sectors */
++	uint32_t    secsize;
++	bool        writable;
++	bool        ready;
++	int         bmajor, cmajor;
++	dev_t       bdev;
++} se;
++
++static uint8_t se_bounce[BOUNCE_SIZE];
++
++static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
++static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
++
++static inline uint32_t
++se_rd32(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.regs + off);
++}
++
++static inline void
++se_wr32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se.regs + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static inline uint16_t
++se_rd16(uint32_t off)
++{
++	return *(volatile uint16_t *)(se.regs + off);
++}
++
++static inline void
++se_wr32_pair(uint32_t off, uint16_t lo, uint16_t hi)
++{
++	se_wr32(off, (uint32_t)lo | ((uint32_t)hi << 16));
++}
++
++static inline uint8_t
++se_rd8(uint32_t off)
++{
++	return *(volatile uint8_t *)(se.regs + off);
++}
++
++/* Milliseconds off the absolute clock, for polling timeouts. */
++static uint64_t
++se_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++/*
++ * Wait until (PRESENT_STATE & mask) == want, or the deadline passes.
++ * Returns 0 on success, ETIMEDOUT otherwise.
++ */
++static int
++se_wait_state(uint32_t mask, uint32_t want, uint32_t timeout_ms)
++{
++	uint64_t deadline = se_now_ms() + timeout_ms;
++
++	for (;;) {
++		if ((se_rd32(REG_PRESENT_STATE) & mask) == want) {
++			return 0;
++		}
++		if (se_now_ms() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/* One command with no data phase. Returns 0 or an errno; *resp gets R1/R3. */
++static int
++se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
++{
++	uint32_t flags = resp_type == CMD_RESP_NONE ? 0 : (CMD_CRC | CMD_INDEX | resp_type);
++	uint64_t deadline;
++
++	if (se_wait_state(PS_CMD_INHIBIT, 0, CMD_TIMEOUT_MS)) {
++		printf("SWEET EMMC: cmd %u: command line busy\n", idx);
++		return EBUSY;
++	}
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++	se_wr32(REG_ARGUMENT, arg);
++	se_wr32_pair(REG_TRANSFER_MODE, 0, (uint16_t)((idx << 8) | flags));
++	/*
++	 * Do the writes actually land? A register file that reads correctly but
++	 * ignores writes is the signature of a wrong memory attribute or of a
++	 * controller whose bus interface clock is gated.
++	 */
++	{
++		uint32_t back_arg = se_rd32(REG_ARGUMENT);
++		uint16_t back_cmd = se_rd16(REG_COMMAND);
++		if (back_arg != arg || (back_cmd & 0x3f00) != (uint16_t)(idx << 8)) {
++			printf("SWEET EMMC: cmd %u write did not stick "
++			    "(arg 0x%08x want 0x%08x, cmd 0x%04x want 0x%04x)\n",
++			    idx, back_arg, arg, back_cmd, (uint16_t)((idx << 8) | flags));
++		}
++	}
++
++	deadline = se_now_ms() + CMD_TIMEOUT_MS;
++	for (;;) {
++		uint32_t st = se_rd32(REG_INT_STATUS);
++		if (st & INT_ERROR_MASK) {
++			printf("SWEET EMMC: cmd %u failed, int 0x%08x\n", idx, st);
++			se_wr32(REG_INT_STATUS, st);
++			return EIO;
++		}
++		/* R1b: the card holds DAT0 busy after the response. */
++		if ((st & INT_RESPONSE) && resp_type == CMD_RESP_SHORT_BUSY) {
++			if (!(se_rd32(REG_PRESENT_STATE) & PS_DATA_INHIBIT)) {
++				se_wr32(REG_INT_STATUS, st);
++				return 0;
++			}
++			st = 0;
++			continue;
++		}
++		/* Command Complete is raised even for commands with no response. */
++		if (st & INT_RESPONSE) {
++			if (resp && resp_type != CMD_RESP_NONE) {
++				*resp = se_rd32(REG_RESPONSE);
++			}
++			se_wr32(REG_INT_STATUS, st);
++			return 0;
++		}
++		if (se_now_ms() > deadline) {
++			printf("SWEET EMMC: cmd %u timed out, int 0x%08x state 0x%08x "
++			    "clk 0x%04x hc 0x%02x hc2 0x%04x\n",
++			    idx, st, se_rd32(REG_PRESENT_STATE), se_rd16(REG_CLOCK_CONTROL),
++			    se_rd8(REG_HOST_CONTROL), se_rd16(REG_HOST_CONTROL2));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
++ * One polled single-block transfer through the buffer port.
++ * The card must already be selected and the block length set to 512.
++ */
++static int
++se_transfer(bool read, uint64_t lba, uint8_t *buf)
++{
++	uint64_t deadline;
++
++	if (se_wait_state(PS_CMD_INHIBIT | PS_DATA_INHIBIT, 0, CMD_TIMEOUT_MS)) {
++		printf("SWEET EMMC: data line busy\n");
++		return EBUSY;
++	}
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++	se_wr32_pair(REG_BLOCK_SIZE, (uint16_t)EMMC_BLOCK, 1);
++	se_wr32(REG_ARGUMENT, (uint32_t)lba);
++	se_wr32_pair(REG_TRANSFER_MODE, (uint16_t)(read ? TM_READ : 0),
++	    (uint16_t)(((read ? 17 : 24) << 8) |
++	    CMD_DATA | CMD_CRC | CMD_INDEX | CMD_RESP_SHORT));
++
++	/* Fill or drain the buffer port for this block. */
++	{
++		uint32_t *p = (uint32_t *)(void *)buf;
++		uint32_t words = EMMC_BLOCK / sizeof(uint32_t);
++		uint64_t dl = se_now_ms() + DATA_TIMEOUT_MS;
++		uint32_t need = read ? PS_DATA_AVAILABLE : PS_SPACE_AVAILABLE;
++
++		while (!(se_rd32(REG_PRESENT_STATE) & need)) {
++			uint32_t st = se_rd32(REG_INT_STATUS);
++			if (st & INT_ERROR_MASK) {
++				printf("SWEET EMMC: %s buffer int 0x%08x\n",
++				    read ? "read" : "write", st);
++				se_wr32(REG_INT_STATUS, st);
++				return EIO;
++			}
++			if (se_now_ms() > dl) {
++				printf("SWEET EMMC: %s buffer timed out, state 0x%08x\n",
++				    read ? "read" : "write", se_rd32(REG_PRESENT_STATE));
++				return ETIMEDOUT;
++			}
++			delay(1);
++		}
++		for (uint32_t w = 0; w < words; w++) {
++			if (read) {
++				p[w] = se_rd32(REG_BUFFER);
++			} else {
++				se_wr32(REG_BUFFER, p[w]);
++			}
++		}
++	}
++
++	/* Wait for DATA_END (and for the data lines to go idle). */
++	deadline = se_now_ms() + DATA_TIMEOUT_MS;
++	for (;;) {
++		uint32_t st = se_rd32(REG_INT_STATUS);
++		if (st & INT_ERROR_MASK) {
++			printf("SWEET EMMC: transfer end int 0x%08x\n", st);
++			se_wr32(REG_INT_STATUS, st);
++			return EIO;
++		}
++		if ((st & INT_DATA_END) &&
++		    !(se_rd32(REG_PRESENT_STATE) & PS_DATA_INHIBIT)) {
++			se_wr32(REG_INT_STATUS, st);
++			return 0;
++		}
++		if (se_now_ms() > deadline) {
++			printf("SWEET EMMC: transfer end timed out, int 0x%08x state 0x%08x\n",
++			    st, se_rd32(REG_PRESENT_STATE));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++static int
++se_read_blocks(uint64_t lba, uint32_t count)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		int error = se_transfer(true, lba + i, se_bounce + (size_t)i * EMMC_BLOCK);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
++static int
++se_write_blocks(uint64_t lba, uint32_t count)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		int error = se_transfer(false, lba + i, se_bounce + (size_t)i * EMMC_BLOCK);
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
++/* -------------------------------------------------------- card bring-up -- */
++
++/*
++ * Put the card back into the one state this driver can drive without
++ * knowing anything about the timing U-Boot left it in: legacy speed,
++ * 1-bit bus, 512-byte blocks, selected with RCA 1. GO_IDLE_STATE is what
++ * makes that safe -- it drops the card out of HS200/HS400/8-bit, so both
++ * ends are in the default single-data-rate mode and no DLL tuning or bus
++ * width switch is involved. U-Boot has already finished reading the boot
++ * image at this point, so nothing is in flight on the bus.
++ */
++/* CURRENT_STATE lives in bits 12:9 of the card status word. */
++#define CARD_STATE(status)      (((status) >> 9) & 0xf)
++#define CARD_STATE_DATA         5       /* mid-transfer */
++#define CARD_STATE_RCV          6
++#define CARD_STATE_TRAN         4
++
++static int
++se_card_init(void)
++{
++	uint32_t resp = 0;
++	int error;
++
++	/*
++	 * The card is already initialised and selected: the bootloader just read
++	 * the boot image off it. All we need is its current status (or, if that
++	 * fails, a full re-identification). Measured: CMD0 on an already-selected
++	 * card does NOT complete on this controller (pitfalls.md 78), so this is
++	 * not just an optimisation.
++	 */
++	printf("SWEET EMMC: asking the selected card for its status\n");
++	for (uint32_t rca = 1; rca <= 2; rca++) {
++		error = se_cmd(13, rca << 16, CMD_RESP_SHORT, &resp);
++		if (!error) {
++			se.rca = rca;
++			break;
++		}
++	}
++	if (error) {
++		printf("SWEET EMMC: card did not answer, re-identifying\n");
++		if ((error = se_cmd(0, 0, CMD_RESP_NONE, NULL))) {
++			return error;
++		}
++		uint64_t deadline = se_now_ms() + 3000;
++		for (;;) {
++			if (se_cmd(1, 0x40ff8080u, CMD_RESP_SHORT, &resp) == 0 &&
++			    (resp & (1u << 31))) {
++				break;
++			}
++			if (se_now_ms() > deadline) {
++				printf("SWEET EMMC: CMD1 never reported ready (ocr 0x%08x)\n", resp);
++				return ENODEV;
++			}
++			delay(10);
++		}
++		if ((error = se_cmd(2, 0, CMD_RESP_LONG, NULL))) {
++			return error;
++		}
++		if ((error = se_cmd(3, 1u << 16, CMD_RESP_SHORT, &resp))) {
++			return error;
++		}
++		se.rca = (resp >> 16) & 0xffff;
++		if (se.rca == 0) {
++			se.rca = 1;
++		}
++		if ((error = se_cmd(7, se.rca << 16, CMD_RESP_SHORT_BUSY, &resp))) {
++			return error;
++		}
++	}
++
++	/*
++	 * A card left mid-transfer (state "data" or "receive") cannot accept
++	 * anything except CMD12. That is exactly the state the bootloader leaves
++	 * behind after its last read, and it is why CMD16 timed out on the first
++	 * attempt at this driver: status 0x00000b00 has CURRENT_STATE = 5.
++	 */
++	printf("SWEET EMMC: card status 0x%08x, state %u\n", resp, CARD_STATE(resp));
++	if (CARD_STATE(resp) == CARD_STATE_DATA || CARD_STATE(resp) == CARD_STATE_RCV) {
++		error = se_cmd(12, 0, CMD_RESP_SHORT_BUSY, NULL);
++		printf("SWEET EMMC: CMD12 (stop transmission) -> %d\n", error);
++		for (int i = 0; i < 20; i++) {
++			if (se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &resp) == 0 &&
++			    CARD_STATE(resp) == CARD_STATE_TRAN) {
++				break;
++			}
++			delay(1);
++		}
++		printf("SWEET EMMC: state after CMD12: %u (status 0x%08x)\n",
++		    CARD_STATE(resp), resp);
++	}
++	if (CARD_STATE(resp) != CARD_STATE_TRAN) {
++		printf("SWEET EMMC: card is not in the transfer state\n");
++		return EBUSY;
++	}
++	/*
++	 * Block length: the bootloader already set 512 and every transfer this
++	 * driver issues is one 512-byte block, so CMD16 is not needed -- and on
++	 * this card it fails, which is a useful thing not to depend on.
++	 */
++	return 0;
++}
++
++/* Print every GPT entry we can decode: the board's own partition layout. */
++static void
++se_dump_gpt(uint32_t nent, uint32_t esz)
++{
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = se_bounce + i * esz;
++		char name[37];
++		unsigned c;
++		uint64_t first, last;
++		bool empty = true;
++
++		for (c = 0; c < 16; c++) {
++			if (e[c]) {
++				empty = false;
++			}
++		}
++		if (empty) {
++			continue;
++		}
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		printf("SWEET EMMC: gpt[%u] \"%s\" lba 0x%llx-0x%llx (%llu MiB)\n",
++		    i, name, first, last, (last >= first) ? (last - first + 1) >> 11 : 0);
++	}
++}
++
++static int
++se_find_partition(const char *want)
++{
++	const uint8_t *b = se_bounce;
++	int error = se_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("SWEET EMMC: no GPT at LBA 1\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	printf("SWEET EMMC: GPT entries 0x%llx, %u x %u\n", entry_lba, nent, esz);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("SWEET EMMC: unsupported GPT entries\n");
++		return ENXIO;
++	}
++	error = se_read_blocks(entry_lba, (nent * esz + EMMC_BLOCK - 1) / EMMC_BLOCK);
++	if (error) {
++		return error;
++	}
++	se_dump_gpt(nent, esz);
++
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first) {
++			return ENXIO;
++		}
++		se.first_block = first;
++		se.nblocks = last - first + 1;
++		return 0;
++	}
++	printf("SWEET EMMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++/* --------------------------------------------------------- block device -- */
++
++static int
++sweet_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!se.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !se.writable) ? EROFS : 0;
++}
++
++static int
++sweet_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * se.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = se.nblocks * EMMC_BLOCK;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !se.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / EMMC_BLOCK;
++		uint32_t skip = (uint32_t)(pos % EMMC_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = MIN((skip + want + EMMC_BLOCK - 1) / EMMC_BLOCK, BOUNCE_BLOCKS);
++
++		if (rd) {
++			error = se_read_blocks(se.first_block + lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, se_bounce + skip, want);
++			}
++		} else {
++			/* Partial blocks at either end: read, merge, write back. */
++			if (skip || (want % EMMC_BLOCK)) {
++				error = se_read_blocks(se.first_block + lba, blocks);
++			}
++			if (!error) {
++				memcpy(se_bounce + skip, vaddr + done, want);
++				error = se_write_blocks(se.first_block + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = se.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f != EMMC_BLOCK && *f != 1024 && *f != 2048) {
++			return EINVAL;
++		}
++		se.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = EMMC_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = se.nblocks * EMMC_BLOCK / se.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = se.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / se.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = se.writable ? BOUNCE_SIZE / se.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_emmc_psize(__unused dev_t dev)
++{
++	return se.ready ? (int)MIN(se.nblocks * EMMC_BLOCK / se.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)se.secsize);
++}
++
++static int
++sweet_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!se.writable) {
++		return EROFS;
++	}
++	return physio(sweet_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)se.secsize);
++}
++
++static const struct bdevsw sweet_emmc_bdevsw = {
++	.d_open     = sweet_emmc_open,
++	.d_close    = sweet_emmc_close,
++	.d_strategy = sweet_emmc_strategy,
++	.d_ioctl    = sweet_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_emmc_cdevsw = {
++	.d_open       = sweet_emmc_open,
++	.d_close      = sweet_emmc_close,
++	.d_read       = sweet_emmc_read,
++	.d_write      = sweet_emmc_write,
++	.d_ioctl      = sweet_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++sweet_emmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int prop_size = 0;
++	char want[64] = "userdata";
++	uint32_t rw = 0;
++	uint32_t hs_caps, hs_version;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &prop_size) != kSuccess ||
++	    prop_size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET EMMC: no /sweet-emmc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
++
++	se.regs = ml_io_map(reg[0], reg[1]);
++	if (se.regs == 0) {
++		printf("SWEET EMMC: cannot map 0x%llx\n", (uint64_t)reg[0]);
++		return ENXIO;
++	}
++	se.secsize = DEV_BSIZE;
++	se.rca = 1;
++
++	hs_version = se_rd16(REG_HOST_VERSION);
++	hs_caps = se_rd32(REG_CAPABILITIES);
++	/*
++	 * CAPABILITIES.CLOCK_BASE is marked broken for this IP (Linux sets
++	 * SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN, U-Boot carries the same quirk), so
++	 * the divider is computed from the core clock the board assigns to the
++	 * controller: assigned-clock-rates = <200000000> in its device tree.
++	 */
++	se.base_hz = BASE_CLOCK_HZ;
++	se.area1 = se_rd32(DWCMSHC_P_VENDOR_AREA1) & DWCMSHC_AREA1_MASK;
++	printf("SWEET EMMC: SDHCI spec %u.%u, caps 0x%08x (clock base field %u MHz, ignored), "
++	    "vendor area 0x%x\n",
++	    (hs_version & 0xff) / 10, (hs_version & 0xff) % 10, hs_caps,
++	    (hs_caps & CAP_CLOCK_BASE_MASK) >> CAP_CLOCK_BASE_SHIFT, se.area1);
++
++	/*
++	 * Polled operation, but INT_ENABLE must stay fully open. This controller
++	 * reports command completion through INT_ENABLE: with INT_ENABLE = 0 no
++	 * command ever completes (the status word stays 0 and the command times
++	 * out), while SIGNAL_ENABLE = 0 alone keeps the IRQ line quiet. Measured
++	 * on the board with a shim-side bisect -- see pitfalls.md 78.
++	 *
++	 * Nothing else in the host is touched. That same bisect showed every
++	 * "return the controller to a known default" step (RESET_ALL, clearing the
++	 * vendor control register, re-programming the power and clock, switching
++	 * to a 1-bit bus) is either harmless or actively breaks the card's clock,
++	 * and the bootloader's configuration is the one configuration that is
++	 * known to work on this board.
++	 */
++	se_wr32(REG_INT_ENABLE, 0xffffffffu);
++	se_wr32(REG_SIGNAL_ENABLE, 0);
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++
++	{
++		uint32_t status = 0;
++		int err = se_cmd(13, 1u << 16, CMD_RESP_SHORT, &status);
++		uint16_t cc = se_rd16(REG_CLOCK_CONTROL);
++		uint32_t div = ((cc >> 8) & 0xff) | (((cc >> 6) & 0x3) << 8);
++		uint32_t base = se.base_hz ? se.base_hz : BASE_CLOCK_HZ;
++		se.hz = div ? base / (2 * div) : base;
++		printf("SWEET EMMC: bootloader state: CMD13 -> %d, status 0x%08x, "
++		    "clk 0x%04x (~%u kHz), hc 0x%02x, hc2 0x%04x, power 0x%02x\n",
++		    err, status, cc, se.hz / 1000, se_rd8(REG_HOST_CONTROL),
++		    se_rd16(REG_HOST_CONTROL2), se_rd8(REG_POWER_CONTROL));
++	}
++
++	int error;
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = se_card_init();
++	if (!error) {
++		error = se_find_partition(want);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	se.bmajor = bdevsw_add(-1, &sweet_emmc_bdevsw);
++	if (se.bmajor < 0) {
++		return ENXIO;
++	}
++	se.cmajor = cdevsw_add_with_bdev(-1, &sweet_emmc_cdevsw, se.bmajor);
++	if (se.cmajor < 0) {
++		return ENXIO;
++	}
++	se.bdev = makedev(se.bmajor, 0);
++	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	se.writable = (rw != 0);
++	se.ready = true;
++	printf("SWEET EMMC: \"%s\": first sector 0x%llx, %llu MiB, %s\n",
++	    want, se.first_block, (se.nblocks * EMMC_BLOCK) >> 20,
++	    se.writable ? "read-write" : "read-only");
++	/*
++	 * The other sweet drivers hang off the storage bring-up in
++	 * bsd/dev/sweet_ufs.c (there is no IOKit matching on this platform), so
++	 * the eMMC path has to start them too -- otherwise buttons, touch and
++	 * the USB gadget never come up on a board without UFS.
++	 */
++	sweet_sample_start();
++	sweet_keys_init();
++	sweet_touch_init();
++	sweet_usb_probe();
++	return 0;
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int sweet_emmc_rootdev(dev_t *dev);
++
++int
++sweet_emmc_rootdev(dev_t *dev)
++{
++	if (!se.ready) {
++		int error = sweet_emmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = se.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..50620f1 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -498,9 +498,12 @@ bsd_init(void)
+ #define bsd_init_kprintf(x, ...)
+ #endif
+ 
++	kprintf("SWEET STAGE: bsd_init entry\n");
+ 	throttle_init();
++	kprintf("SWEET STAGE: throttle_init done\n");
+ 
+ 	printf(copyright);
++	kprintf("SWEET STAGE: copyright printed\n");
+ 
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..9fbd3dc 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,6 +44,12 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'arm,cortex-a55';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetCPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'qcom,kryo470';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..4132ad3 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,18 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int sweet_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = sweet_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: SWEET eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..c5da643 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -776,10 +776,12 @@ kernel_bootstrap_thread(void)
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	kprintf("SWEET STAGE: vm_set_restrictions(%u)\n", machine_info.max_cpus);
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 
+ 
+ #if KPERF
++	kprintf("SWEET STAGE: kperf_init_early\n");
+ 	kperf_init_early();
+ #endif
+ 
+@@ -787,7 +789,9 @@ kernel_bootstrap_thread(void)
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++	kprintf("SWEET STAGE: bsd_init\n");
+ 	bsd_init();
++	kprintf("SWEET STAGE: bsd_init returned\n");
+ #endif
+ 
+ 
