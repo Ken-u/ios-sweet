@@ -272,7 +272,24 @@
  
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -842,6 +842,138 @@
+@@ -822,6 +822,16 @@
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return;
+ 	}
++	/*
++	 * A board whose bootloader hands over no framebuffer still gets this node
++	 * (the ADT is generated before the live tree is known), with reg=<0,0>.
++	 * Mapping physical 0 and painting it would scribble over whatever lives
++	 * there -- on RK3588 that abort showed up much later as "Invalid kernel
++	 * stack pointer". Treat a zero base as "no framebuffer".
++	 */
++	if (reg[0] == 0 || reg[1] == 0) {
++		return;
++	}
+ 	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_width = *val;
+ 	}
+@@ -842,6 +852,138 @@
  	}
  }
  
@@ -411,7 +428,7 @@
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -914,14 +1046,25 @@
+@@ -914,14 +1056,25 @@
  		return 1;
  	}
  
