@@ -182,7 +182,52 @@
  kern_return_t serial_irq_enable(serial_device_t device);
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -514,6 +514,27 @@
+@@ -212,6 +212,44 @@
+ 	.text
+ 
+ 
++#if defined(SWEET)
++/*
++ * RK3588 bring-up markers.
++ *
++ * The board hands over no framebuffer, so sweet_early_mark() (which paints the
++ * Redmi Note 10 Pro's splash buffer at 0x9c000000) is invisible here -- that
++ * address is plain DRAM on RK3588. A polled write to the debug UART works at
++ * every point in this file, with the MMU on or off, because 0xfeb50000 is
++ * mapped identity (bootstrap tables) and the shim has already programmed it
++ * for 1500000 8N1.
++ *
++ * Format: one character per marker, so the position in the boot sequence is
++ * readable straight off the serial line.
++ */
++.macro SWEET_UART_MARK ch
++	/*
++	 * Runtime gate on the CPU implementer: ARM Ltd reports 0x41, Qualcomm's
++	 * custom Kryo cores report 0x51. The same SWEET kernel binary boots both
++	 * the Redmi Note 10 Pro and this board, and 0xfeb50000 is not a UART on
++	 * SM7150 -- writing there could disturb an unrelated block on the one
++	 * working installation. Checking MIDR_EL1 costs a few cycles and makes
++	 * the marker a no-op on the phone.
++	 */
++	mrs		x13, MIDR_EL1
++	lsr		x13, x13, #24
++	cmp		x13, #0x41
++	b.ne	9997f
++	MOV64	x13, 0xfeb50000
++	mov	w14, #\ch
++	str		w14, [x13]
++	dsb		sy
++9997:
++.endmacro
++#else
++.macro SWEET_UART_MARK ch
++.endmacro
++#endif
++
+ /*
+  * __start trampoline is located at a position relative to LowResetVectorBase
+  * so that iBoot can compute the reset vector position to set IORVBAR using
+@@ -514,6 +552,20 @@
  	mov		x21, #0
  
  #if defined(SWEET)
@@ -198,24 +243,15 @@
 +	 * store to the physical UART. 0xfeb50000 is RK3588's debug UART; the shim
 +	 * has already programmed it for 1500000 8N1, so only THR is written.
 +	 */
-+	MOV64	x0, 0xfeb50000
-+	mov	w1, #'K'
-+	str	w1, [x0]
-+	mov	w1, #'\r'
-+	str	w1, [x0]
-+	mov	w1, #'\n'
-+	str	w1, [x0]
-+	dsb		sy
++	SWEET_UART_MARK 'K'
 +
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
  	MOV64	x0, (0x9c000000 + 2368 * 4320)
  	mov		w1, #-1
-@@ -691,6 +712,26 @@
- 	orr		x11, x11, x10
- 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+@@ -693,8 +745,30 @@
  	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
-+	add		x13, x25, #(2 * PGBYTES)
-+	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
 +
 +	/*
 +	 * RK3588 debug UART: map 0xfe000000..0xffffffff as Device, in the same
@@ -234,6 +270,30 @@
 +	orr		x11, x11, x10
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 +	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
- 	add		x13, x25, #(2 * PGBYTES)
- 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
  #endif
+ 
++	SWEET_UART_MARK 'T'
++
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
+@@ -837,6 +911,8 @@
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	SWEET_UART_MARK 'M'
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
+@@ -899,6 +975,8 @@
+ 	mov	lr, x21
+ #endif
+ 
++	SWEET_UART_MARK 'C'
++
+ 	// Return to arm_init()
+ 	ret
+ 
