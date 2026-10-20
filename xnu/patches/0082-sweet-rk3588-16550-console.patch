@@ -1,0 +1,161 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -842,6 +842,138 @@
+ 	}
+ }
+ 
++/*****************************************************************************/
++
++/*
++ * sweet on RK3588: 16550-compatible debug UART.
++ *
++ * The Redmi Note 10 Pro's UART is unusable (its engine runs in SPI mode), so
++ * that board uses the framebuffer console above. A dev board is the opposite
++ * case: the console is a plain DesignWare 16550 at a fixed physical address and
++ * there is no framebuffer at all, so this is the only output path.
++ *
++ * Described by the ADT node "sweet-uart16550":
++ *   reg      = <phys size>   absolute physical address, NOT arm-io relative
++ *   divisor  = <n>           clock / (16 * baud); the shim already programmed
++ *                            the same value, so this normally only re-confirms it
++ *
++ * The shim leaves the UART running with FIFOs enabled and interrupts off, so
++ * init() here is deliberately non-destructive: it re-writes the line control
++ * and divisor but does not reset the FIFOs (that would drop boot-loader output
++ * that the shim has already queued).
++ */
++
++#define U16550_RBR      0x00
++#define U16550_THR      0x00
++#define U16550_DLL      0x00
++#define U16550_IER      0x04
++#define U16550_DLH      0x04
++#define U16550_FCR      0x08
++#define U16550_LCR      0x0c
++#define U16550_MCR      0x10
++#define U16550_LSR      0x14
++#define U16550_LSR_DR   (1u << 0)
++#define U16550_LSR_THRE (1u << 5)
++#define U16550_LCR_DLAB (1u << 7)
++#define U16550_LCR_8N1  0x03u
++
++static volatile uint8_t *uart16550_base;
++static uint32_t uart16550_divisor = 1;
++
++static inline uint32_t
++uart16550_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(uart16550_base + off);
++}
++
++static inline void
++uart16550_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(uart16550_base + off) = v;
++}
++
++static void
++uart16550_init(void)
++{
++	if (uart16550_base == NULL) {
++		return;
++	}
++	uart16550_wr(U16550_IER, 0x00);
++	uart16550_wr(U16550_LCR, U16550_LCR_DLAB);
++	uart16550_wr(U16550_DLL, uart16550_divisor & 0xff);
++	uart16550_wr(U16550_DLH, (uart16550_divisor >> 8) & 0xff);
++	uart16550_wr(U16550_LCR, U16550_LCR_8N1);
++	uart16550_wr(U16550_FCR, 0x07);   /* enable + clear both FIFOs */
++	uart16550_wr(U16550_MCR, 0x03);   /* DTR | RTS */
++}
++
++static unsigned int
++uart16550_transmit_ready(void)
++{
++	/* Bounded: a wedged UART must not hang the console. */
++	for (unsigned int i = 0; i < 100000; i++) {
++		if (uart16550_rd(U16550_LSR) & U16550_LSR_THRE) {
++			return 1;
++		}
++	}
++	return 1;
++}
++
++static void
++uart16550_transmit_data(uint8_t c)
++{
++	uart16550_wr(U16550_THR, c);
++}
++
++static unsigned int
++uart16550_receive_ready(void)
++{
++	return (uart16550_rd(U16550_LSR) & U16550_LSR_DR) ? 1 : 0;
++}
++
++static uint8_t
++uart16550_receive_data(void)
++{
++	return (uint8_t)uart16550_rd(U16550_RBR);
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_uart16550_functions =
++{
++	.init = uart16550_init,
++	.transmit_ready = uart16550_transmit_ready,
++	.transmit_data = uart16550_transmit_data,
++	.receive_ready = uart16550_receive_ready,
++	.receive_data = uart16550_receive_data,
++	.device = SERIAL_SWEET_UART16550
++};
++
++static void
++uart16550_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	uint32_t const *val;
++	unsigned int size;
++
++	if (SecureDTFindEntry("name", "sweet-uart16550", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return;
++	}
++	if (SecureDTGetProperty(entry, "divisor", (void const **)&val, &size) == kSuccess) {
++		uart16550_divisor = *val;
++	}
++
++	/*
++	 * The address is absolute, not relative to arm-io's "ranges": the shim
++	 * passes the physical address straight through and RK3588's SOC_BASE is
++	 * 0, so an arm-io offset would only ever be a no-op or a bug.
++	 */
++	uart16550_base = (volatile uint8_t *)ml_io_map(reg[0], reg[1] ? reg[1] : 0x1000);
++	if (uart16550_base != NULL) {
++		register_serial_functions(&sweet_uart16550_functions);
++	}
++}
++
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation
+@@ -923,6 +1055,7 @@
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
+ 	fbcon_probe();
++	uart16550_probe();
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -51,7 +51,8 @@
+ 	SERIAL_PI3_UART=0x4,
+ 	SERIAL_VMAPPLE_UART=0x8,
+ 	SERIAL_DCC_UART=0x10,
+-	SERIAL_SWEET_FBCON=0x20
++	SERIAL_SWEET_FBCON=0x20,
++	SERIAL_SWEET_UART16550=0x40
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
