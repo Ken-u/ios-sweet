@@ -1,0 +1,83 @@
+From: kkagent <noreply@example.com>
+Subject: [PATCH] sweet rk3588: check the card is in TRAN before a write
+
+写路径的最后一块。0086 管"失败之后怎么恢复"，这个管"别让写落在错误的
+卡状态上"：
+
+  * 卡停在 RCV 时发 CMD24，主机报 DATA_END、卡不发 CRC status，
+    下一条命令看到 DATA_INHIBIT 常置（pitfalls.md 110B）；
+  * se_ensure_tran() 在每次写之前发一条 CMD13，状态不是 TRAN 就先走
+    se_recover_data() 再重试；
+  * 每次传输多一条 CMD13。传输本来就是一整块 512 字节，bring-up 阶段
+    这点开销可以接受。日志限流到前 4 次。
+
+---
+ bsd/dev/sweet_emmc.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -212,6 +212,7 @@
+  */
+ static uint8_t *se_bounce;
+ static uint32_t se_busy_logs;
++static uint32_t se_tran_logs;
+ 
+ static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
+ static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
+@@ -458,6 +459,39 @@
+ }
+ 
+ /*
++ * Make sure the card is in the transfer state before a command that needs it.
++ *
++ * On this board a write that starts while the card is still in RCV does not
++ * fail cleanly: the host reports DATA_END, the card never sends the CRC status
++ * word, and the next command sees DATA_INHIBIT stuck (pitfalls.md 110B). Asking
++ * for the status first turns that into one recovery instead of a dead device.
++ * Costs one CMD13 per transfer, and transfers here are one 512-byte block, so
++ * that is affordable during bring-up.
++ */
++static int
++se_ensure_tran(void)
++{
++	uint32_t resp = 0;
++	int error;
++
++	error = se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &resp);
++	if (error == 0 && (resp >> 9 & 0xf) == 4 /* TRAN */) {
++		return 0;
++	}
++	if (error == 0) {
++		if (se_tran_logs++ < 4) {
++			printf("SWEET EMMC: card in state %u before a transfer, recovering\n",
++			    (resp >> 9) & 0xf);
++		}
++	} else if (se_tran_logs++ < 4) {
++		printf("SWEET EMMC: CMD13 before a transfer failed (%d), recovering\n", error);
++	}
++	se_recover_data();
++	return se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &resp) == 0 &&
++	    ((resp >> 9) & 0xf) == 4 ? 0 : EBUSY;
++}
++
++/*
+  * One SDMA single-block transfer. The card must already be selected and the
+  * block length set to 512.
+  *
+@@ -485,6 +519,14 @@
+ 		return EIO;
+ 	}
+ 
++	/*
++	 * A write that starts on a card which is not in TRAN is the failure this
++	 * driver kept hitting, so check first (see se_ensure_tran()).
++	 */
++	if (!read && se_ensure_tran()) {
++		return EBUSY;
++	}
++
+ 	if (se_wait_state(PS_CMD_INHIBIT | PS_DATA_INHIBIT, 0, CMD_TIMEOUT_MS)) {
+ 		/*
+ 		 * Rate-limited on purpose. Before recovery worked, one stuck card made
