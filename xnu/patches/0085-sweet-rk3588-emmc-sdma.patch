@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
-index 437891f..952fc4c 100644
+index 437891f..fbd0662 100644
 --- a/bsd/dev/sweet_emmc.c
 +++ b/bsd/dev/sweet_emmc.c
 @@ -16,13 +16,16 @@
@@ -40,7 +40,7 @@ index 437891f..952fc4c 100644
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
-@@ -148,20 +153,24 @@ extern void sweet_wdt_start(void);
+@@ -148,20 +153,30 @@ extern void sweet_wdt_start(void);
  
  #define EMMC_BLOCK              512u
  /*
@@ -70,10 +70,16 @@ index 437891f..952fc4c 100644
 + * with it. Keep the same value.
 + */
 +#define BLKSZ_SDMA_BOUNDARY     (7u << 12)
++/*
++ * Highest page number SDMA can reach on this controller: DMA_ADDRESS is 32
++ * bits wide, so everything must stay below 4 GiB. kmem_alloc_contig takes an
++ * *exclusive* page limit.
++ */
++#define DMA_MAX_PNUM            ((ppnum_t)(0x100000000ULL >> PAGE_SHIFT))
  /*
   * Legacy (default) speed. The card is put back through GO_IDLE_STATE, which
   * also drops it out of whatever HS200/HS400 timing U-Boot left it in; the
-@@ -175,6 +184,8 @@ extern void sweet_wdt_start(void);
+@@ -175,6 +190,8 @@ extern void sweet_wdt_start(void);
  
  static struct {
  	vm_offset_t regs;
@@ -82,7 +88,7 @@ index 437891f..952fc4c 100644
  	uint32_t    area1;              /* vendor area 1 offset (dwcmshc) */
  	uint32_t    base_hz;            /* host base clock from CAPABILITIES */
  	uint32_t    rca;
-@@ -187,7 +198,13 @@ static struct {
+@@ -187,7 +204,13 @@ static struct {
  	dev_t       bdev;
  } se;
  
@@ -97,7 +103,7 @@ index 437891f..952fc4c 100644
  
  static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
  static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
-@@ -318,77 +335,102 @@ se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
+@@ -318,77 +341,102 @@ se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
  }
  
  /*
@@ -243,18 +249,22 @@ index 437891f..952fc4c 100644
  }
  
  static int
-@@ -861,6 +903,29 @@ sweet_emmc_init(void)
+@@ -861,6 +909,33 @@ sweet_emmc_init(void)
  		printf("SWEET EMMC: cannot map 0x%llx\n", (uint64_t)reg[0]);
  		return ENXIO;
  	}
 +	/*
 +	 * One physically contiguous, page-aligned staging area for SDMA. It must
 +	 * stay below 4 GiB: this controller's DMA_ADDRESS register is 32 bits and
-+	 * CAPABILITIES bit 28 (64-bit addressing) is clear.
++	 * CAPABILITIES bit 28 (64-bit addressing) is clear. Without the limit the
++	 * first allocation landed at 0x10358c000 -- above 4 GiB -- and the root
++	 * device failed with ENOMEM before anything else ran.
 +	 */
 +	if (kmem_alloc_contig(kernel_map, &se.stage, BOUNCE_SIZE, PAGE_MASK,
-+	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
-+		printf("SWEET EMMC: no contiguous DMA memory (%u bytes)\n", BOUNCE_SIZE);
++	    DMA_MAX_PNUM, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET EMMC: no contiguous DMA memory below 4 GiB (%u bytes)\n",
++		    BOUNCE_SIZE);
 +		return ENOMEM;
 +	}
 +	{
