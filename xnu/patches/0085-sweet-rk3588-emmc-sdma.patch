@@ -1,0 +1,275 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 437891f..952fc4c 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -16,13 +16,16 @@
+  *     status word of zero. So INT_ENABLE stays fully open and only
+  *     SIGNAL_ENABLE is cleared, which is what keeps this driver polled.
+  *   - The data path only completes in the bus configuration the bootloader
+- *     left, and its PIO limit there is four blocks per command -- the same
+- *     limit U-Boot itself applies in HS200/HS400.
++ *     left.
+  *
+- * Data therefore moves through the SDHCI buffer port one word at a time:
+- * no DMA memory, no cache maintenance at all, which matters on a machine
+- * whose caches are not coherent with the storage host (this kernel has
+- * __ARM_COHERENT_CACHE__, so no driver here does manual cache work).
++ * Data moves through SDMA into one physically contiguous buffer. PIO was
++ * tried first (no DMA memory, no cache maintenance) and it reads fine but
++ * cannot write: on this controller a PIO write ends with
++ * PRESENT_STATE = 0x02070000 and INT_STATUS = 0 -- the card goes to RCV, the
++ * data phase never starts, and the block is never touched. The same command
++ * with SDMA enabled replaces the block contents correctly. See pitfalls.md
++ * 109 for the register-level bisect; the scripts under toolchain/uboot-wtest*.py
++ * reproduce it from the U-Boot prompt without touching the kernel.
+  *
+  * It finds one GPT partition by name (boot-arg emmcroot=, default
+  * "userdata"), prints the whole GPT to the console, and exposes the partition
+@@ -47,12 +50,14 @@
+ #include <machine/machine_routines.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -148,20 +153,24 @@ extern void sweet_wdt_start(void);
+ 
+ #define EMMC_BLOCK              512u
+ /*
+- * One block per command. Multi-block PIO is where U-Boot's own driver limits
+- * itself to four blocks in these speed modes, and single-block CMD17/CMD24 is
+- * the variant that was verified on this board from the shim. Reading a whole
++ * One block per command: single-block CMD17/CMD24 is the variant that was
++ * verified on this board (from U-Boot and from the shim). Reading a whole
+  * partition this way is slow, but the boot path only reads the GPT.
+- */
+-/*
+- * The bounce buffer has to hold the whole GPT entry array in one go (128
+- * entries x 128 bytes = 16 KiB, i.e. 32 blocks). One command still moves one
+- * block; this only sizes the staging area.
++ *
++ * The staging area holds the whole GPT entry array in one go (128 entries x
++ * 128 bytes = 16 KiB, i.e. 32 blocks). One command still moves one block;
++ * this only sizes the allocation.
+  */
+ #define BOUNCE_BLOCKS           32u
+ #define BOUNCE_SIZE             (BOUNCE_BLOCKS * EMMC_BLOCK)
+ #define CMD_TIMEOUT_MS          1000u
+ #define DATA_TIMEOUT_MS         5000u
++/*
++ * SDMA boundary in BLOCK_SIZE bits 14:12. U-Boot writes 7 (4 KiB), which is
++ * also this controller's default, and the measured working transfers all ran
++ * with it. Keep the same value.
++ */
++#define BLKSZ_SDMA_BOUNDARY     (7u << 12)
+ /*
+  * Legacy (default) speed. The card is put back through GO_IDLE_STATE, which
+  * also drops it out of whatever HS200/HS400 timing U-Boot left it in; the
+@@ -175,6 +184,8 @@ extern void sweet_wdt_start(void);
+ 
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t stage;              /* kernel VA of the contiguous staging area */
++	uint64_t    stage_pa;           /* its physical address (32-bit reachable) */
+ 	uint32_t    area1;              /* vendor area 1 offset (dwcmshc) */
+ 	uint32_t    base_hz;            /* host base clock from CAPABILITIES */
+ 	uint32_t    rca;
+@@ -187,7 +198,13 @@ static struct {
+ 	dev_t       bdev;
+ } se;
+ 
+-static uint8_t se_bounce[BOUNCE_SIZE];
++/*
++ * The staging area every transfer goes through. It has to be physically
++ * contiguous (SDMA), and it has to sit below 4 GiB: CAPABILITIES bit 28
++ * (64-bit addressing v4) is clear on this controller, so a higher address
++ * would be silently truncated into the 32-bit DMA_ADDRESS register.
++ */
++static uint8_t *se_bounce;
+ 
+ static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
+ static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
+@@ -318,77 +335,102 @@ se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
+ }
+ 
+ /*
+- * One polled single-block transfer through the buffer port.
+- * The card must already be selected and the block length set to 512.
++ * Get the card out of a half-finished data phase. CMD12 is the only command a
++ * card in RCV/DATA state accepts, and skipping it leaves the card unusable for
++ * everyone afterwards (pitfalls.md 80).
++ */
++static void
++se_abort_transfer(void)
++{
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++	se_wr32(REG_ARGUMENT, 0);
++	se_wr32_pair(REG_TRANSFER_MODE, 0,
++	    (uint16_t)((12 << 8) | CMD_CRC | CMD_INDEX | CMD_RESP_SHORT_BUSY));
++	for (uint32_t spin = 0; spin < 100; spin++) {
++		if (se_rd32(REG_INT_STATUS) & (INT_RESPONSE | INT_ERROR_MASK)) {
++			break;
++		}
++		delay(1);
++	}
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++}
++
++/*
++ * One SDMA single-block transfer. The card must already be selected and the
++ * block length set to 512.
++ *
++ * SDMA, not PIO: measured on this board (pitfalls.md 109, reproduced from the
++ * U-Boot prompt by toolchain/uboot-wtest5.py), a PIO write to this controller
++ * ends with INT_STATUS = 0 and PRESENT_STATE = 0x02070000 -- the card enters
++ * RCV, the host never asserts DOING_WRITE, and the block keeps its old
++ * contents. Exactly the same command with TRANSFER_MODE.DMA_ENABLE set moves
++ * the data. Reads work either way, so this is specific to the write path.
++ *
++ * `buf` must point inside the contiguous staging area: the controller only
++ * has a 32-bit DMA address register here (CAPABILITIES bit 28 is clear).
+  */
+ static int
+ se_transfer(bool read, uint64_t lba, uint8_t *buf)
+ {
+ 	uint64_t deadline;
++	uint64_t pa = se.stage_pa + (uint64_t)(buf - se_bounce);
++	uint16_t mode = (uint16_t)(TM_DMA | TM_BLOCK_COUNT_EN | (read ? TM_READ : 0));
++	uint16_t cmd = (uint16_t)(((read ? 17 : 24) << 8) |
++	    CMD_DATA | CMD_CRC | CMD_INDEX | CMD_RESP_SHORT);
++
++	if ((uint32_t)pa != pa) {
++		printf("SWEET EMMC: staging buffer above 4 GiB (0x%llx)\n", pa);
++		return EIO;
++	}
+ 
+ 	if (se_wait_state(PS_CMD_INHIBIT | PS_DATA_INHIBIT, 0, CMD_TIMEOUT_MS)) {
+ 		printf("SWEET EMMC: data line busy\n");
+ 		return EBUSY;
+ 	}
+ 	se_wr32(REG_INT_STATUS, 0xffffffffu);
+-	se_wr32_pair(REG_BLOCK_SIZE, (uint16_t)EMMC_BLOCK, 1);
+-	se_wr32(REG_ARGUMENT, (uint32_t)lba);
+-	se_wr32_pair(REG_TRANSFER_MODE, (uint16_t)(read ? TM_READ : 0),
+-	    (uint16_t)(((read ? 17 : 24) << 8) |
+-	    CMD_DATA | CMD_CRC | CMD_INDEX | CMD_RESP_SHORT));
+ 
+-	/* Fill or drain the buffer port for this block. */
+-	{
+-		uint32_t *p = (uint32_t *)(void *)buf;
+-		uint32_t words = EMMC_BLOCK / sizeof(uint32_t);
+-		uint64_t dl = se_now_ms() + DATA_TIMEOUT_MS;
+-		uint32_t need = read ? PS_DATA_AVAILABLE : PS_SPACE_AVAILABLE;
+-
+-		while (!(se_rd32(REG_PRESENT_STATE) & need)) {
+-			uint32_t st = se_rd32(REG_INT_STATUS);
+-			if (st & INT_ERROR_MASK) {
+-				printf("SWEET EMMC: %s buffer int 0x%08x\n",
+-				    read ? "read" : "write", st);
+-				se_wr32(REG_INT_STATUS, st);
+-				return EIO;
+-			}
+-			if (se_now_ms() > dl) {
+-				printf("SWEET EMMC: %s buffer timed out, state 0x%08x\n",
+-				    read ? "read" : "write", se_rd32(REG_PRESENT_STATE));
+-				return ETIMEDOUT;
+-			}
+-			delay(1);
+-		}
+-		for (uint32_t w = 0; w < words; w++) {
+-			if (read) {
+-				p[w] = se_rd32(REG_BUFFER);
+-			} else {
+-				se_wr32(REG_BUFFER, p[w]);
+-			}
+-		}
+-	}
++	/*
++	 * Clean the staging block to the point of coherency before the controller
++	 * reads it (write) and again after it has filled it (read), so neither
++	 * direction depends on the storage host being coherent with the CPU.
++	 */
++	flush_dcache64(pa, EMMC_BLOCK, TRUE);
+ 
+-	/* Wait for DATA_END (and for the data lines to go idle). */
++	se_wr32_pair(REG_BLOCK_SIZE, (uint16_t)(BLKSZ_SDMA_BOUNDARY | EMMC_BLOCK), 1);
++	se_wr32(REG_ARGUMENT, (uint32_t)lba);
++	se_wr32(REG_DMA_ADDR, (uint32_t)pa);
++	se_wr32_pair(REG_TRANSFER_MODE, mode, cmd);
++
++	/* Command response first, then the end of the data phase. */
+ 	deadline = se_now_ms() + DATA_TIMEOUT_MS;
+ 	for (;;) {
+ 		uint32_t st = se_rd32(REG_INT_STATUS);
++
+ 		if (st & INT_ERROR_MASK) {
+-			printf("SWEET EMMC: transfer end int 0x%08x\n", st);
++			printf("SWEET EMMC: %s cmd int 0x%08x state 0x%08x\n",
++			    read ? "read" : "write", st, se_rd32(REG_PRESENT_STATE));
+ 			se_wr32(REG_INT_STATUS, st);
++			se_abort_transfer();
+ 			return EIO;
+ 		}
+-		if ((st & INT_DATA_END) &&
++		if ((st & INT_RESPONSE) && (st & INT_DATA_END) &&
+ 		    !(se_rd32(REG_PRESENT_STATE) & PS_DATA_INHIBIT)) {
+ 			se_wr32(REG_INT_STATUS, st);
+-			return 0;
++			break;
+ 		}
+ 		if (se_now_ms() > deadline) {
+-			printf("SWEET EMMC: transfer end timed out, int 0x%08x state 0x%08x\n",
+-			    st, se_rd32(REG_PRESENT_STATE));
++			printf("SWEET EMMC: %s timed out, int 0x%08x state 0x%08x\n",
++			    read ? "read" : "write", st, se_rd32(REG_PRESENT_STATE));
++			se_abort_transfer();
+ 			return ETIMEDOUT;
+ 		}
+ 		delay(1);
+ 	}
++
++	if (read) {
++		flush_dcache64(pa, EMMC_BLOCK, TRUE);
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -861,6 +903,29 @@ sweet_emmc_init(void)
+ 		printf("SWEET EMMC: cannot map 0x%llx\n", (uint64_t)reg[0]);
+ 		return ENXIO;
+ 	}
++	/*
++	 * One physically contiguous, page-aligned staging area for SDMA. It must
++	 * stay below 4 GiB: this controller's DMA_ADDRESS register is 32 bits and
++	 * CAPABILITIES bit 28 (64-bit addressing) is clear.
++	 */
++	if (kmem_alloc_contig(kernel_map, &se.stage, BOUNCE_SIZE, PAGE_MASK,
++	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		printf("SWEET EMMC: no contiguous DMA memory (%u bytes)\n", BOUNCE_SIZE);
++		return ENOMEM;
++	}
++	{
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.stage);
++		if (!pn) {
++			printf("SWEET EMMC: staging area has no physical page\n");
++			return ENOMEM;
++		}
++		se.stage_pa = ptoa_64(pn);
++		if ((uint32_t)se.stage_pa != se.stage_pa) {
++			printf("SWEET EMMC: staging area at 0x%llx is above 4 GiB\n", se.stage_pa);
++			return ENOMEM;
++		}
++	}
++	se_bounce = (uint8_t *)se.stage;
+ 	se.secsize = DEV_BSIZE;
+ 	se.rca = 1;
+ 
