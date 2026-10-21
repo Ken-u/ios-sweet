@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
-index 437891f..fbd0662 100644
+index 437891f..5459fed 100644
 --- a/bsd/dev/sweet_emmc.c
 +++ b/bsd/dev/sweet_emmc.c
 @@ -16,13 +16,16 @@
@@ -103,7 +103,21 @@ index 437891f..fbd0662 100644
  
  static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
  static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
-@@ -318,77 +341,102 @@ se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
+@@ -223,6 +246,13 @@ se_rd8(uint32_t off)
+ 	return *(volatile uint8_t *)(se.regs + off);
+ }
+ 
++static inline void
++se_wr8(uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)(se.regs + off) = v;
++	__builtin_arm_dsb(0xf);
++}
++
+ /* Milliseconds off the absolute clock, for polling timeouts. */
+ static uint64_t
+ se_now_ms(void)
+@@ -318,77 +348,112 @@ se_cmd(uint8_t idx, uint32_t arg, uint32_t resp_type, uint32_t *resp)
  }
  
  /*
@@ -207,6 +221,16 @@ index 437891f..fbd0662 100644
  
 -	/* Wait for DATA_END (and for the data lines to go idle). */
 +	se_wr32_pair(REG_BLOCK_SIZE, (uint16_t)(BLKSZ_SDMA_BOUNDARY | EMMC_BLOCK), 1);
++	/*
++	 * U-Boot writes TIMEOUT_CONTROL = 0x0e before every data command, and
++	 * every measured working transfer ran with that value in place. Leaving
++	 * it at zero makes the host's data timeout counter expire immediately,
++	 * which is exactly the symptom seen without it: the data phase starts
++	 * (PRESENT_STATE shows DOING_WRITE) but DATA_END never arrives and no
++	 * error bit is raised. 0x2e is an 8-bit register -- a 32-bit store here
++	 * would also clobber POWER_CONTROL and INT_STATUS (pitfalls.md 105).
++	 */
++	se_wr8(REG_TIMEOUT_CONTROL, 0x0e);
 +	se_wr32(REG_ARGUMENT, (uint32_t)lba);
 +	se_wr32(REG_DMA_ADDR, (uint32_t)pa);
 +	se_wr32_pair(REG_TRANSFER_MODE, mode, cmd);
@@ -249,7 +273,7 @@ index 437891f..fbd0662 100644
  }
  
  static int
-@@ -861,6 +909,33 @@ sweet_emmc_init(void)
+@@ -861,6 +926,33 @@ sweet_emmc_init(void)
  		printf("SWEET EMMC: cannot map 0x%llx\n", (uint64_t)reg[0]);
  		return ENXIO;
  	}
