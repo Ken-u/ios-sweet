@@ -1,0 +1,163 @@
+From: kkagent <noreply@example.com>
+Subject: [PATCH] sweet rk3588: eMMC 写失败后真正恢复数据通路
+
+第 109 条的结论只对了一半：SDMA 写确实比 PIO 写得进去，但它在
+"之前有过一次 PIO 数据访问"之后同样失败。实测（pitfalls.md 110）：
+
+  U-Boot 提示符，SDMA 读 -> SDMA 写       写失败 int=0x00108000 (DATA_TIMEOUT)
+  U-Boot 提示符，PIO 读  -> SDMA 写       写失败 int=0x00000000 (和 PIO 写同指纹)
+
+内核侧 v24 的表现是 int=0x00000101（DATA_END|RESPONSE）：主机认为数据阶段
+结束，卡却停在 RCV。原先的 se_abort_transfer() 只发一条 CMD12，救不回来，
+PRESENT_STATE.DATA_INHIBIT 常置，之后每次传输都返回 EBUSY 并打印
+"data line busy"，1.5 Mbaud 串口被这一行刷满，内核看起来像死了。
+
+改动：
+  1. se_reset()          写 SOFTWARE_RESET 并等它自清；
+  2. se_recover_data()   CMD12 -> RESET_DATA -> RESET_ALL，逐级升级，
+                         复位后重新打开 INT_ENABLE 并读一次 CMD13 报告卡状态；
+  3. "data line busy" 限流（前 4 次 + 每 256 次一行），并顺手触发恢复。
+
+没有改传输本身的时序和 SDMA 配置——真凶在卡的状态机，不在数据通路。
+---
+ bsd/dev/sweet_emmc.c | 102 ++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -211,6 +211,7 @@
+  * would be silently truncated into the 32-bit DMA_ADDRESS register.
+  */
+ static uint8_t *se_bounce;
++static uint32_t se_busy_logs;
+ 
+ static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
+ static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
+@@ -352,9 +353,53 @@
+  * card in RCV/DATA state accepts, and skipping it leaves the card unusable for
+  * everyone afterwards (pitfalls.md 80).
+  */
++/*
++ * Reset one SDHCI block (CMD / DATA / ALL) and wait for the bit to self-clear.
++ * A reset that is still asserted when the next command is written makes that
++ * command disappear without any interrupt at all, which is indistinguishable
++ * from a dead card -- so this waits.
++ */
++static int
++se_reset(uint32_t bits)
++{
++	uint32_t v;
++	int spin;
++
++	se_wr8(REG_SOFTWARE_RESET, (uint8_t)bits);
++	for (spin = 0; spin < 1000; spin++) {
++		v = se_rd8(REG_SOFTWARE_RESET) & bits;
++		if (v == 0) {
++			delay(1);
++			return 0;
++		}
++		delay(1);
++	}
++	printf("SWEET EMMC: reset 0x%x did not clear (still 0x%x)\n", bits, v);
++	return ETIMEDOUT;
++}
++
++/*
++ * Bring the card and the data path back to a usable state after a failed
++ * transfer.
++ *
++ * CMD12 alone is not enough on this board: after a write that ends with the
++ * host reporting DATA_END while the card is still in RCV, the stop command is
++ * answered (or ignored) but the card does not leave RCV, PRESENT_STATE keeps
++ * DATA_INHIBIT set, and every later transfer returns EBUSY forever. Measured
++ * on 2026-10-21 (pitfalls.md 110B): the log filled with "data line busy" and
++ * never recovered.
++ *
++ * So: CMD12 first (cheap, and works in the cases where the card is only
++ * waiting for a stop), then a DATA reset, then verify the inhibit is gone.
++ * RESET_ALL is the last resort -- it also drops the bus state U-Boot left,
++ * which the card does not tolerate (pitfalls.md 78), so it is only used when
++ * DATA reset did not help.
++ */
+ static void
+-se_abort_transfer(void)
++se_recover_data(void)
+ {
++	uint32_t st;
++
+ 	se_wr32(REG_INT_STATUS, 0xffffffffu);
+ 	se_wr32(REG_ARGUMENT, 0);
+ 	se_wr32_pair(REG_TRANSFER_MODE, 0,
+@@ -366,6 +411,50 @@
+ 		delay(1);
+ 	}
+ 	se_wr32(REG_INT_STATUS, 0xffffffffu);
++
++	st = se_rd32(REG_PRESENT_STATE);
++	if (!(st & PS_DATA_INHIBIT)) {
++		return;
++	}
++
++	/* The card is still holding DAT0..DAT7. Reset the data path. */
++	if (se_reset(RESET_DATA) == 0) {
++		se_wr32(REG_INT_STATUS, 0xffffffffu);
++		if (!(se_rd32(REG_PRESENT_STATE) & PS_DATA_INHIBIT)) {
++			return;
++		}
++	}
++
++	printf("SWEET EMMC: data path stuck (ps 0x%08x), resetting the host\n",
++	    se_rd32(REG_PRESENT_STATE));
++	se_reset(RESET_ALL);
++	se_wr32(REG_INT_ENABLE, 0xffffffffu);
++	se_wr32(REG_SIGNAL_ENABLE, 0);
++	se_wr32(REG_INT_STATUS, 0xffffffffu);
++
++	/*
++	 * RESET_ALL drops the bus state U-Boot left (8-bit, HS400 timing), which
++	 * on this card also makes CMD13 fail (pitfalls.md 78). Say so explicitly:
++	 * the next transfer will report something confusing otherwise.
++	 */
++	{
++		uint32_t resp = 0;
++
++		if (se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &resp) == 0) {
++			/* CURRENT_STATE is bits 12:9; CARD_STATE is defined further down. */
++			printf("SWEET EMMC: after reset, card state %u (status 0x%08x)\n",
++			    (resp >> 9) & 0xf, resp);
++		} else {
++			printf("SWEET EMMC: after reset the card does not answer CMD13\n");
++		}
++	}
++}
++
++/* Name kept for the call sites that only want the old behaviour. */
++static void
++se_abort_transfer(void)
++{
++	se_recover_data();
+ }
+ 
+ /*
+@@ -397,9 +486,19 @@
+ 	}
+ 
+ 	if (se_wait_state(PS_CMD_INHIBIT | PS_DATA_INHIBIT, 0, CMD_TIMEOUT_MS)) {
+-		printf("SWEET EMMC: data line busy\n");
++		/*
++		 * Rate-limited on purpose. Before recovery worked, one stuck card made
++		 * this print on every retry and the resulting 1.5 Mbaud serial stream
++		 * was the only thing the kernel appeared to do (pitfalls.md 110B).
++		 */
++		if (se_busy_logs++ < 4 || (se_busy_logs % 256) == 0) {
++			printf("SWEET EMMC: data line busy (ps 0x%08x, %u times), recovering\n",
++			    se_rd32(REG_PRESENT_STATE), se_busy_logs);
++		}
++		se_recover_data();
+ 		return EBUSY;
+ 	}
++	se_busy_logs = 0;
+ 	se_wr32(REG_INT_STATUS, 0xffffffffu);
+ 
+ 	/*
