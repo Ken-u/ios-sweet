@@ -1,0 +1,109 @@
+From: kkagent <noreply@example.com>
+Subject: [PATCH] sweet rk3588: wait for the card to finish a write
+
+写完一块之后主机侧 `DATA_END` 只代表"主机把这块搬出去了"，卡还要自己
+编程 flash，这段时间 DAT0 被拉低、卡还没回到 TRAN。在这个窗口里发下一条
+命令（包括 CMD13、CMD12）都是违规命令，卡会把 `ILLEGAL_COMMAND` 挂到
+**下一条**命令的响应里（pitfalls.md 113）。
+
+两处改动：
+
+  * `se_wait_ready()`：写完之后用 CMD13 轮询，直到状态是 TRAN 且
+    `READY_FOR_DATA` 置位，1 秒超时；读不轮询（读不编程）。
+  * `se_recover_data()` 里发 CMD12 之前先看卡状态，只有 DATA/RCV 才发。
+    卡在 TRAN/PROGRAMMING 时无条件补一条 CMD12，本身就是把卡推进违规
+    状态的元凶——0086 加的那条 CMD12 反而成了后半段失败的来源。
+
+---
+ bsd/dev/sweet_emmc.c | 59 +++++++++++++++++++++++++++++++++++++++++++++++----
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -401,6 +401,30 @@
+ {
+ 	uint32_t st;
+ 
++	/*
++	 * Only send CMD12 when the card is actually in the middle of a transfer.
++	 *
++	 * A stop command issued while the card sits in TRAN or PROGRAMMING is
++	 * itself an illegal command, and the card answers the *next* command with
++	 * ILLEGAL_COMMAND set in its status (measured, pitfalls.md 113). The old
++	 * version sent CMD12 unconditionally on every failure path, which put the
++	 * card into exactly that state.
++	 */
++	{
++		uint32_t cs = 0;
++
++		if (se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &cs) == 0) {
++			uint32_t state = (cs >> 9) & 0xf;
++
++			if (state != 5 /* DATA */ && state != 6 /* RCV */) {
++				se_wr32(REG_INT_STATUS, 0xffffffffu);
++				if (!(se_rd32(REG_PRESENT_STATE) & PS_DATA_INHIBIT)) {
++					return;
++				}
++			}
++		}
++	}
++
+ 	se_wr32(REG_INT_STATUS, 0xffffffffu);
+ 	se_wr32(REG_ARGUMENT, 0);
+ 	se_wr32_pair(REG_TRANSFER_MODE, 0,
+@@ -492,6 +516,40 @@
+ }
+ 
+ /*
++ * Wait until the card has finished its internal programming and reports
++ * READY_FOR_DATA in TRAN.
++ *
++ * DATA_END from the host controller only means the host moved the block; the
++ * card then writes its flash and holds DAT0 low while it does. Issuing the
++ * next command inside that window is what made every second write fail with
++ * ILLEGAL_COMMAND (pitfalls.md 113). Cost: one CMD13 per block, which is why
++ * this only runs after writes -- reads do not program anything.
++ */
++#define CARD_STATUS_READY_FOR_DATA (1u << 8)
++
++static int
++se_wait_ready(uint32_t timeout_ms)
++{
++	uint64_t deadline = se_now_ms() + timeout_ms;
++	uint32_t resp = 0;
++
++	for (;;) {
++		if (se_cmd(13, se.rca << 16, CMD_RESP_SHORT, &resp) == 0 &&
++		    ((resp >> 9) & 0xf) == 4 /* TRAN */ &&
++		    (resp & CARD_STATUS_READY_FOR_DATA)) {
++			return 0;
++		}
++		if (se_now_ms() > deadline) {
++			printf("SWEET EMMC: card still busy after %u ms "
++			    "(state %u, status 0x%08x)\n",
++			    timeout_ms, (resp >> 9) & 0xf, resp);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
+  * One SDMA single-block transfer. The card must already be selected and the
+  * block length set to 512.
+  *
+@@ -593,8 +651,14 @@
+ 
+ 	if (read) {
+ 		flush_dcache64(pa, EMMC_BLOCK, TRUE);
++		return 0;
+ 	}
+-	return 0;
++
++	/*
++	 * A write is not finished when the host has sent the block: the card is
++	 * still programming. Wait for it before the caller issues anything else.
++	 */
++	return se_wait_ready(1000);
+ }
+ 
+ static int
